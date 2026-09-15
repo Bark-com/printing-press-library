@@ -32,12 +32,24 @@ func newNovelOverlapCmd(flags *rootFlags) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "overlap",
-		Short: "Pairwise overlap percentages across custom audiences.",
-		Long: `For each pair of supplied custom audience IDs, look up the overlap percentage
-in the local store (synced via Meta's audience_overlap endpoint). Flags pairs
-with >30% overlap as cannibalization risk.
+		Short: "Pairwise overlap percentages across custom audiences. NOT AVAILABLE: see Long.",
+		Long: `Bark fork note (confirmed against Meta's current Custom Audience API
+reference — no overlap-related field or edge exists, and no field exposes
+audience membership either, so it can't be computed locally from member
+lists): Meta's Marketing API does not expose audience overlap data in any
+form. This command can never produce real output no matter what has been
+synced — pairwise audience overlap is only available through Business
+Manager's "Audience overlap" tool in the Ads Manager UI. This was true
+even at this CLI's original design time (its own design brief hedged with
+"uses Meta's audience_overlap endpoint when available, else local set
+math" — neither path was ever actually reachable, which is also why this
+command's own upstream verification only ever asserted the "no data"
+placeholder response, never real output).
 
-Specify at least two audiences with repeated --audience flags.`,
+Kept in the tool surface (rather than removed) so an agent calling it on a
+marketing team's behalf gets a clear, actionable answer instead of no
+capability to ask about at all — see the not-available-via-api verdict
+below.`,
 		Example: `  meta-ads-pp-cli overlap --audience 23847001 --audience 23847002 --audience 23847003 --agent
   meta-ads-pp-cli overlap --audience 23847001 --audience 23847002 --json`,
 		Annotations: map[string]string{"mcp:read-only": "true"},
@@ -46,7 +58,7 @@ Specify at least two audiences with repeated --audience flags.`,
 				return cmd.Help()
 			}
 			if dryRunOK(flags) {
-				fmt.Fprintln(cmd.OutOrStdout(), "would compute pairwise overlap from local audience_overlap store")
+				fmt.Fprintln(cmd.OutOrStdout(), "would report not-available-via-api for every pair — Meta's API does not expose audience overlap data (see --help)")
 				return nil
 			}
 			if len(flagAudience) < 2 {
@@ -76,8 +88,20 @@ Specify at least two audiences with repeated --audience flags.`,
 					pct, ok := lookupOverlap(cmd.Context(), db, a, b)
 					pair := overlapPair{AudienceA: a, AudienceB: b}
 					if !ok {
-						pair.Verdict = "no-data"
-						pair.Note = "no overlap row in local store; sync audience_overlap resource for this pair"
+						// Bark fork fix: was "no-data" / "sync ... for this
+						// pair", which reads as "temporarily missing, try
+						// syncing" when the true answer is "can never work
+						// via the API, don't bother" — see the command's
+						// --help for why. lookupOverlap will never find a
+						// row: nothing populates resource_type
+						// audience_overlap/customaudiences_overlap anywhere
+						// in this codebase, and nothing ever can, since Meta
+						// doesn't expose this data. The query is left in
+						// place rather than short-circuited, in case a
+						// future world (a manual import, or Meta adding
+						// this to the API) ever does populate it.
+						pair.Verdict = "not-available-via-api"
+						pair.Note = "Meta's Marketing API does not expose audience overlap data for any custom audience pair; check Business Manager's Audience overlap tool in the Ads Manager UI instead"
 					} else {
 						pair.OverlapPct = pct
 						if pct >= 30 {
@@ -93,14 +117,14 @@ Specify at least two audiences with repeated --audience flags.`,
 				}
 			}
 
-			missing := 0
+			unavailable := 0
 			for _, p := range view.Pairs {
-				if p.Verdict == "no-data" {
-					missing++
+				if p.Verdict == "not-available-via-api" {
+					unavailable++
 				}
 			}
-			if missing == len(view.Pairs) {
-				view.Note = "no audience_overlap data in local store. Meta's audience_overlap endpoint needs to be called separately and persisted before this command can compute overlap."
+			if unavailable == len(view.Pairs) {
+				view.Note = "Meta's Marketing API does not expose audience overlap data in any form (confirmed against the current Custom Audience API reference — no overlap field/edge, and no member-list edge to compute it from locally either). This is a structural API limitation, not a sync gap: no amount of syncing will ever populate this. Check Business Manager's Audience overlap tool in the Ads Manager UI instead."
 			}
 			return printJSONFiltered(cmd.OutOrStdout(), view, flags)
 		},

@@ -95,3 +95,34 @@ func TestReconcileAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
 		t.Fatalf("insights_spend = %v, want 120.00", view.Rows[0].InsightsSpend)
 	}
 }
+
+// TestOverlap_ReportsNotAvailableViaAPI verifies overlap reports the
+// honest, actionable verdict — confirmed against Meta's current Custom
+// Audience API reference that no overlap or membership data is exposed at
+// all, so this can never resolve to real data no matter what's synced.
+// Regression guard against reintroducing the old "no-data"/"sync ... for
+// this pair" wording, which reads as a temporary gap rather than a
+// structural API limitation.
+func TestOverlap_ReportsNotAvailableViaAPI(t *testing.T) {
+	db := newTestStore(t)
+
+	flags := &rootFlags{asJSON: true}
+	cmd := newNovelOverlapCmd(flags)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--audience", "a1", "--audience", "a2", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("overlap failed: %v", err)
+	}
+
+	var view overlapView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if len(view.Pairs) != 1 || view.Pairs[0].Verdict != "not-available-via-api" {
+		t.Fatalf("verdict = %+v, want exactly one pair with not-available-via-api", view.Pairs)
+	}
+	if view.Note == "" {
+		t.Fatalf("expected a top-level Note explaining the structural API limitation, got none")
+	}
+}
