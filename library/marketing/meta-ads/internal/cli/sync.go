@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,12 @@ type syncResult struct {
 	Err      error
 	Warn     error
 	Duration time.Duration
+	// DependencyIssue marks a Warn caused by a missing prerequisite sync
+	// step (e.g. "sync campaigns" before its `me` parent table exists), not
+	// a Meta API access denial. Bark fork addition: RunE's exit-message
+	// logic checks this so it doesn't call a dependency-ordering mistake
+	// "insufficient access" — see Bark-com/printing-press-library#3.
+	DependencyIssue bool
 }
 
 func newSyncCmd(flags *rootFlags) *cobra.Command {
@@ -202,9 +209,25 @@ Resource scoping:
 				concurrency = 1
 			}
 
+			// Bark fork addition (see accountScopedCascadeResources /
+			// adScopedCascadeResources doc comment below): the generated spec
+			// never wired path templates for these account/ad-nested
+			// resources, so they can't go through the flat worker pool above
+			// (syncResourcePath would reject them). Split them out and run
+			// them after the flat pool, in dependency order, feeding results
+			// through the same counters via accumulate().
+			var flatResources, cascadeResources []string
+			for _, resource := range resources {
+				if isCascadeResource(resource) {
+					cascadeResources = append(cascadeResources, resource)
+				} else {
+					flatResources = append(flatResources, resource)
+				}
+			}
+
 			started := time.Now()
-			work := make(chan string, len(resources))
-			results := make(chan syncResult, len(resources))
+			work := make(chan string, len(flatResources))
+			results := make(chan syncResult, len(flatResources))
 
 			var wg sync.WaitGroup
 			for i := 0; i < concurrency; i++ {
@@ -218,8 +241,8 @@ Resource scoping:
 				}()
 			}
 
-			// Enqueue all resources
-			for _, resource := range resources {
+			// Enqueue flat resources only; cascade resources run afterward.
+			for _, resource := range flatResources {
 				work <- resource
 			}
 			close(work)
@@ -237,7 +260,17 @@ Resource scoping:
 			var successCount int
 			var firstErr error
 			var firstPlaceholderErr error
-			for res := range results {
+			// dependencyIssueCount tracks how many warnings were "a
+			// prerequisite resource hasn't been synced yet" rather than a
+			// Meta access denial (Bark fork addition — see
+			// syncResult.DependencyIssue's doc comment). Confirmed live
+			// this distinction matters: without it, running `sync
+			// --resources campaigns` before `sync --resources me` reported
+			// "resource(s) skipped due to insufficient access", which sent
+			// debugging toward Meta permissions when the actual fix was
+			// just "sync me first."
+			var dependencyIssueCount int
+			accumulate := func(res syncResult) {
 				if res.Err != nil {
 					if humanFriendly {
 						fmt.Fprintf(os.Stderr, "  %s: error: %v\n", res.Resource, res.Err)
@@ -257,12 +290,41 @@ Resource scoping:
 						fmt.Fprintf(os.Stderr, "  %s: warning: %v\n", res.Resource, res.Warn)
 					}
 					warnCount++
+					if res.DependencyIssue {
+						dependencyIssueCount++
+					}
 				} else {
 					if humanFriendly {
 						fmt.Fprintf(os.Stderr, "  %s: %d synced (done)\n", res.Resource, res.Count)
 					}
 					totalSynced += res.Count
 					successCount++
+				}
+			}
+			for res := range results {
+				accumulate(res)
+			}
+
+			// Cascade resources run sequentially, account-scoped before
+			// ad-scoped (adcreatives/insights need the `ads` table populated
+			// first — either earlier in this loop or by a prior sync run).
+			for _, resource := range cascadeResources {
+				if pathTemplate, ok := accountScopedCascadeResources[resource]; ok {
+					var extraParams map[string]string
+					if fields, ok := accountScopedSyncFields[resource]; ok {
+						extraParams = map[string]string{"fields": fields}
+					}
+					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "me", "adAccountId", extraParams, concurrency, syncEventWriter))
+				}
+			}
+			for _, resource := range cascadeResources {
+				if pathTemplate, ok := adScopedCascadeResources[resource]; ok {
+					extraParams := map[string]string{}
+					if resource == "insights" {
+						extraParams["fields"] = insightsSyncFields
+						extraParams["time_increment"] = "1"
+					}
+					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "ads", "adId", extraParams, concurrency, syncEventWriter))
 				}
 			}
 
@@ -301,6 +363,12 @@ Resource scoping:
 			}
 			if successCount == 0 {
 				if warnCount > 0 && errCount == 0 {
+					if dependencyIssueCount == warnCount {
+						return fmt.Errorf("%d resource(s) skipped: a prerequisite resource hasn't been synced yet (see warnings above for which one)", warnCount)
+					}
+					if dependencyIssueCount > 0 {
+						return fmt.Errorf("%d resource(s) skipped: %d due to a missing prerequisite sync, %d due to insufficient access (see warnings above)", warnCount, dependencyIssueCount, warnCount-dependencyIssueCount)
+					}
 					return fmt.Errorf("%d resource(s) skipped due to insufficient access", warnCount)
 				}
 				if errCount > 0 {
@@ -333,6 +401,452 @@ Resource scoping:
 	cmd.Flags().StringArrayVar(&globalParamFlags, "global-param", nil, "Extra query param to inject into every sync request including dependent path-scoped calls (repeatable, key=value). Use when an API requires a scope on every call regardless of path nesting.")
 
 	return cmd
+}
+
+// Bark fork addition (not upstream): the generated spec (CLI Printing
+// Press) emitted live-read commands and store upsert methods for these
+// resources but never wired sync path templates for them — see
+// https://github.com/mvanhorn/printing-press-library/issues/1434. Every
+// value here is copied verbatim from this same package's live-read
+// commands' `pp:path` annotation (promoted_campaigns.go, promoted_adsets.go,
+// promoted_ads.go, promoted_customaudiences.go, promoted_adcreatives.go,
+// insights_get-ad.go) so it can never drift from what the live tools
+// actually call.
+//
+// accountScopedCascadeResources are nested under /{adAccountId}/<resource>;
+// their parent rows come from the already-synced `me` table.
+var accountScopedCascadeResources = map[string]string{
+	"campaigns":       "/{adAccountId}/campaigns",
+	"adsets":          "/{adAccountId}/adsets",
+	"ads":             "/{adAccountId}/ads",
+	"customaudiences": "/{adAccountId}/customaudiences",
+}
+
+// adScopedCascadeResources are nested one level deeper, under
+// /{adId}/<resource>; their parent rows come from the `ads` table, which
+// must already be populated (accountScopedCascadeResources["ads"] earlier
+// in this same sync run, or a prior one).
+var adScopedCascadeResources = map[string]string{
+	"adcreatives": "/{adId}/adcreatives",
+	"insights":    "/{adId}/insights",
+}
+
+// insightsSyncFields requests the field set the fatigue/decay/reconcile
+// analysis commands actually read (impressions/spend/cpm/ctr/frequency for
+// fatigue+decay, actions/purchase_roas/action_values for reconcile) — the
+// bare insights endpoint defaults to spend+impressions only, which is why
+// those analysis commands found nothing even on a successful sync.
+//
+// Also requests ad_id/adset_id/campaign_id/account_id explicitly: Meta only
+// returns exactly the fields asked for, and since this call is scoped to a
+// single ad (/{adId}/insights) it won't include ad_id unasked. Without it,
+// upsertInsightsTx's ad_id/adset_id/campaign_id/account_id domain-table
+// columns land NULL, and fatigue/decay/reconcile (which query by those
+// columns) can't match the very rows this sync exists to populate. Flagged
+// by review on Bark-com/printing-press-library#3.
+const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,spend,cpm,ctr,frequency,reach,actions,purchase_roas,action_values"
+
+// accountScopedSyncFields requests an explicit, minimal field set for the
+// account-scoped resources instead of none at all. Omitting `fields`
+// entirely makes Meta return its *default* field set for that node type,
+// and — confirmed against a real Bark ad account with an ads_read-only
+// token — that default set can include fields gated behind more than
+// ads_read, 403ing the whole request even though the identical endpoint
+// with an explicit narrow field list (exactly what the live-read tools
+// always send) succeeds. Field lists here match what's already confirmed
+// working live; keep them narrow — this is deliberately not "every field
+// the analysis tools might someday want," just enough to unblock the sync
+// path with the permissions Bark's System User actually has today.
+//
+// customaudiences requesting no `fields` is what we'd otherwise ship with,
+// but it still hasn't been exercised live — Meta documents listing custom
+// audiences as generally requiring ads_management, not ads_read, regardless
+// of fields, so the field list alone won't unblock it without that grant.
+// Requesting it proactively anyway (rather than waiting to hit the same
+// default-field trap a second time once ads_management is granted): fields
+// here are exactly the columns upsertCustomaudiencesTx writes to the domain
+// table — descriptive/count metadata only, nothing touching audience
+// membership, targeting rules, or data source, which are the more
+// plausible candidates for needing more than ads_management.
+// adsets/ads additionally request their parent-linkage fields
+// (campaign_id, and for ads adset_id too) — confirmed missing live: with
+// the original id/name/status/effective_status-only lists, upsertAdsetsTx's
+// campaign_id column and upsertAdsTx's adset_id/campaign_id columns landed
+// NULL on every one of 5,799 synced adsets / 15,822 synced ads, which is
+// exactly why bottleneck/learning/inventory (which scope by those columns)
+// reported "no adsets/ads in local store" despite a successful sync. Same
+// bug class as insightsSyncFields above, just missed here the first time.
+var accountScopedSyncFields = map[string]string{
+	"campaigns":       "id,name,objective,status,effective_status",
+	"adsets":          "id,name,campaign_id,status,effective_status",
+	"ads":             "id,name,adset_id,campaign_id,status,effective_status",
+	"customaudiences": "id,name,subtype,description,approximate_count_lower_bound,approximate_count_upper_bound,time_created,time_updated",
+}
+
+func isCascadeResource(resource string) bool {
+	if _, ok := accountScopedCascadeResources[resource]; ok {
+		return true
+	}
+	_, ok := adScopedCascadeResources[resource]
+	return ok
+}
+
+// cascadeSyncBudget bounds how long a single sync invocation spends
+// fetching one cascade resource's per-parent fan-out. Deliberately not a
+// flag: this MCP host is used by a marketing team through an agent, not a
+// human typing a shell command, so there is no reliable way for a caller
+// to know about — let alone remember to pass — a bounding flag. Confirmed
+// live: an unbounded fan-out over thousands of parents (15,822 ads on one
+// real Bark account) makes an MCP tool call look hung, since nothing comes
+// back before any reasonable client timeout. Matches the reasoning behind
+// upstream #1774's peloton fix, which hit the identical problem and added
+// an MCP-shellout-detected default bound for exactly this reason: "no MCP
+// agent can be expected to already know about a flag it was never told to
+// pass." This goes further by making it the *only* behavior (no flag to
+// discover at all) rather than an environment-conditional default, since
+// every known caller here is MCP, not a human shell session.
+// var, not const, so tests can temporarily lower it to exercise the
+// cutoff/resume path without a real 25-second wait.
+var cascadeSyncBudget = 25 * time.Second
+
+// ensureCascadeFetchStateTable creates the (resource, parent_id) ->
+// last_fetched_at tracking table this fork's cascade sync uses for
+// resumability, entirely within sync.go rather than touching the
+// generated store.go. Safe to call every run (CREATE TABLE IF NOT EXISTS).
+func ensureCascadeFetchStateTable(db *store.Store) error {
+	_, err := db.DB().Exec(`CREATE TABLE IF NOT EXISTS bark_cascade_fetch_state (
+		resource TEXT NOT NULL,
+		parent_id TEXT NOT NULL,
+		last_fetched_at TEXT NOT NULL,
+		PRIMARY KEY (resource, parent_id)
+	)`)
+	return err
+}
+
+// orderCascadeCandidates returns parentIDs ordered never-fetched-first,
+// then oldest-fetched-first, so a time-budget-limited call always makes
+// forward progress on the most-overdue parents instead of repeatedly
+// re-fetching the same head of the list on every invocation — the same
+// "oldest-fetched-first candidate ordering" principle upstream #1774 uses
+// for its bounded/resumable dependent sync. Falls back to parentIDs
+// unchanged (with a logged warning) if the tracking table can't be read,
+// so a bookkeeping problem degrades to "less optimal ordering" rather than
+// failing the sync outright.
+func orderCascadeCandidates(db *store.Store, resource string, parentIDs []string, syncEvents io.Writer) []string {
+	if err := ensureCascadeFetchStateTable(db); err != nil {
+		if !humanFriendly {
+			fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","reason":"fetch_state_unavailable","message":"could not prepare resumable-sync bookkeeping (%s); falling back to unordered fetch"}`+"\n", resource, strings.ReplaceAll(err.Error(), `"`, `\"`))
+		}
+		return parentIDs
+	}
+
+	rows, err := db.DB().Query(`SELECT parent_id, last_fetched_at FROM bark_cascade_fetch_state WHERE resource = ?`, resource)
+	if err != nil {
+		return parentIDs
+	}
+	defer rows.Close()
+
+	lastFetched := make(map[string]time.Time, len(parentIDs))
+	for rows.Next() {
+		var parentID, ts string
+		if rows.Scan(&parentID, &ts) != nil {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			lastFetched[parentID] = t
+		}
+	}
+	if rows.Err() != nil {
+		return parentIDs
+	}
+
+	ordered := make([]string, len(parentIDs))
+	copy(ordered, parentIDs)
+	sort.Slice(ordered, func(i, j int) bool {
+		ti, oki := lastFetched[ordered[i]]
+		tj, okj := lastFetched[ordered[j]]
+		switch {
+		case !oki && !okj:
+			return ordered[i] < ordered[j] // deterministic tie-break
+		case !oki:
+			return true // never-fetched sorts first
+		case !okj:
+			return false
+		default:
+			return ti.Before(tj)
+		}
+	})
+	return ordered
+}
+
+// recordCascadeFetched marks parentID as attempted for resource, right
+// now. Called for every attempted parent regardless of outcome (success,
+// empty, denied, or errored) — a denied parent still gets recorded so a
+// permission problem doesn't cause the same denied parent to eat the
+// front of every future call's time budget forever; it naturally cycles
+// back to the front of orderCascadeCandidates once every other parent has
+// had a more recent turn. Best-effort: a failure here degrades to
+// "next call may re-fetch this parent sooner than ideal," not a sync
+// failure, so its error is deliberately discarded.
+func recordCascadeFetched(db *store.Store, resource, parentID string, at time.Time) {
+	_, _ = db.DB().Exec(
+		`INSERT INTO bark_cascade_fetch_state (resource, parent_id, last_fetched_at) VALUES (?, ?, ?)
+		 ON CONFLICT(resource, parent_id) DO UPDATE SET last_fetched_at = excluded.last_fetched_at`,
+		resource, parentID, at.UTC().Format(time.RFC3339),
+	)
+}
+
+// syncCascadeResource syncs `resource` once per row already synced into
+// parentResourceType, substituting each row's id for parentIDPlaceholder in
+// pathTemplate.
+//
+// Pagination is delegated to paginatedGet(fetchAll=true) — the same,
+// already-tested function the live-read `--all` path uses (see
+// TestPaginatedGetAutoDetectsMetaGraphCursor) — rather than the generic
+// extractPageItems loop syncResource uses, because that generic loop does
+// not resolve Meta's actual paging.cursors.after shape (only paginatedGet's
+// PATCH(meta-graph-cursor-pagination) auto-detection does).
+//
+// Parents are processed through a bounded worker pool (concurrency, same
+// flag/value the flat-resource pool above uses — including its
+// PRINTING_PRESS_VERIFY=1 clamp to 1) and capped by cascadeSyncBudget: the
+// dispatcher stops feeding new parents once the budget is spent (workers
+// already in flight finish normally), and every attempted parent is
+// recorded in bark_cascade_fetch_state so the next call picks up the
+// most-overdue parents first rather than re-fetching the same ones. A
+// large account therefore drains its backlog over a few calls, each one
+// safely inside an MCP tool call's timeout, without any flag the caller
+// needs to know about.
+func syncCascadeResource(ctx context.Context, c interface {
+	GetWithHeaders(ctx context.Context, path string, params map[string]string, headers map[string]string) (json.RawMessage, error)
+}, db *store.Store, resource, pathTemplate, parentResourceType, parentIDPlaceholder string, extraParams map[string]string, concurrency int, syncEvents io.Writer) syncResult {
+	started := time.Now()
+	deadline := started.Add(cascadeSyncBudget)
+	if syncEvents == nil {
+		syncEvents = io.Discard
+	}
+	if concurrency < 1 {
+		concurrency = 4
+	}
+
+	parentIDs, err := db.ListIDs(parentResourceType)
+	if err != nil {
+		return syncResult{Resource: resource, Err: fmt.Errorf("listing synced %s to scope %s: %w", parentResourceType, resource, err), Duration: time.Since(started)}
+	}
+	if len(parentIDs) == 0 {
+		msg := fmt.Sprintf("no synced %s rows found; run 'sync --resources %s' first", parentResourceType, parentResourceType)
+		if !humanFriendly {
+			fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","reason":"parent_not_synced","message":"%s"}`+"\n", resource, msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", resource, msg)
+		}
+		// DependencyIssue: true — a missing prerequisite sync step is not a
+		// Meta permission denial, and RunE's exit-message logic must not
+		// conflate the two (confirmed live: this exact case was surfacing as
+		// "N resource(s) skipped due to insufficient access", which sent
+		// debugging in the wrong direction entirely).
+		return syncResult{Resource: resource, Warn: errors.New(msg), DependencyIssue: true, Duration: time.Since(started)}
+	}
+
+	candidates := orderCascadeCandidates(db, resource, parentIDs, syncEvents)
+
+	if !humanFriendly {
+		fmt.Fprintf(syncEvents, `{"event":"sync_start","resource":"%s","scoped_by":"%s","parents":%d}`+"\n", resource, parentResourceType, len(candidates))
+	}
+
+	limit := determinePaginationDefaults().limit
+
+	type parentOutcome struct {
+		count      int
+		incomplete bool
+		err        error
+	}
+
+	work := make(chan string)
+	outcomes := make(chan parentOutcome, len(candidates))
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for parentID := range work {
+				path := replacePathParam(pathTemplate, parentIDPlaceholder, parentID)
+				params := map[string]string{"limit": strconv.Itoa(limit)}
+				for k, v := range extraParams {
+					params[k] = v
+				}
+
+				data, err := paginatedGet(ctx, c, path, params, nil, true, "after", "offset", "limit", "paging.cursors.after", "")
+				recordCascadeFetched(db, resource, parentID, time.Now())
+				if err != nil {
+					if w, ok := isSyncAccessWarning(err); ok {
+						if !humanFriendly {
+							fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","parent_id":"%s","status":%d,"reason":"%s"}`+"\n", resource, parentID, w.Status, w.Reason)
+						}
+						outcomes <- parentOutcome{incomplete: true}
+						continue
+					}
+					e := fmt.Errorf("fetching %s for %s %s: %w", resource, parentIDPlaceholder, parentID, err)
+					if !humanFriendly {
+						fmt.Fprintln(syncEvents, syncErrorJSON(resource, parentID, e))
+					}
+					outcomes <- parentOutcome{incomplete: true, err: e}
+					continue
+				}
+
+				var items []json.RawMessage
+				if err := json.Unmarshal(data, &items); err != nil || len(items) == 0 {
+					outcomes <- parentOutcome{}
+					continue
+				}
+				if resource == "insights" {
+					items = withSyntheticInsightsIDs(items, parentID)
+				}
+
+				stored, _, err := db.UpsertBatch(resource, items)
+				if err != nil {
+					e := fmt.Errorf("upserting %s for %s %s: %w", resource, parentIDPlaceholder, parentID, err)
+					if !humanFriendly {
+						fmt.Fprintln(syncEvents, syncErrorJSON(resource, parentID, e))
+					}
+					outcomes <- parentOutcome{incomplete: true, err: e}
+					continue
+				}
+				outcomes <- parentOutcome{count: stored}
+			}
+		}()
+	}
+
+	// Dispatcher: feeds candidates to the worker pool in order, but stops
+	// once the time budget is spent — workers already holding a parent
+	// finish it normally (using the original, non-deadlined ctx below),
+	// they just don't get handed a new one. dispatched is only ever
+	// written here and is safe to read after the outcomes loop below
+	// closes, since that loop can't finish until every worker (and
+	// therefore this dispatcher, which they block on) has returned.
+	//
+	// A plain "check deadline, then send" is not enough: work is
+	// unbuffered, so `work <- parentID` blocks until a worker is free,
+	// and a deadline check made before that blocking send started is
+	// stale by the time it unblocks (confirmed by a failing test: with a
+	// single busy worker, the dispatcher's pre-send check passed, then the
+	// send itself blocked past the deadline waiting for the worker, and
+	// still went through once the worker freed up). select against the
+	// deadline on the send itself instead, so a send that's still blocked
+	// when the deadline arrives aborts instead of completing late.
+	dispatchCtx, cancelDispatch := context.WithDeadline(ctx, deadline)
+	defer cancelDispatch()
+	dispatched := 0
+	go func() {
+		defer close(work)
+		for _, parentID := range candidates {
+			select {
+			case work <- parentID:
+				dispatched++
+			case <-dispatchCtx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(outcomes)
+	}()
+
+	var totalCount int
+	var lastErr error
+	// incompleteParents counts parents that contributed zero rows because of
+	// a denial or an error (as opposed to a parent that genuinely has no
+	// data) — tracked separately from lastErr so a failure on one parent
+	// can't get silently absorbed into an overall "success" just because
+	// another parent's fetch happened to land some rows first. Flagged by
+	// review on Bark-com/printing-press-library#3.
+	var incompleteParents int
+	for o := range outcomes {
+		if o.err != nil {
+			lastErr = o.err
+		}
+		if o.incomplete {
+			incompleteParents++
+		}
+		totalCount += o.count
+	}
+
+	remaining := len(candidates) - dispatched
+	_ = db.SaveSyncState(resource, "", totalCount)
+
+	if !humanFriendly {
+		fmt.Fprintf(syncEvents, `{"event":"sync_complete","resource":"%s","total":%d,"processed_parents":%d,"remaining_parents":%d,"duration_ms":%d}`+"\n", resource, totalCount, dispatched, remaining, time.Since(started).Milliseconds())
+		if remaining > 0 {
+			fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","reason":"time_budget_reached","message":"synced %d of %d %s in this call; already-fetched ones are skipped automatically next time, so calling sync again continues where this left off"}`+"\n", resource, dispatched, len(candidates), parentResourceType)
+		}
+	}
+
+	if lastErr != nil && totalCount == 0 {
+		return syncResult{Resource: resource, Err: lastErr, Duration: time.Since(started)}
+	}
+	if incompleteParents > 0 {
+		// Some (or, if totalCount == 0, all) attempted parents were denied
+		// or errored. Reporting this as a plain success would let an
+		// incomplete account/ad-scoped dataset pass silently — surface it
+		// as a warning instead, same as syncResource does for a single
+		// denied resource. Hitting the time budget with 0 incomplete
+		// parents is NOT reported this way — that's expected, successful,
+		// partial progress on a large account, not a problem.
+		msg := fmt.Errorf("%s: %d/%d attempted parent(s) failed or were denied; dataset is incomplete", resource, incompleteParents, dispatched)
+		return syncResult{Resource: resource, Count: totalCount, Warn: msg, Duration: time.Since(started)}
+	}
+	return syncResult{Resource: resource, Count: totalCount, Duration: time.Since(started)}
+}
+
+// withSyntheticInsightsIDs injects an "id" field into each insights item
+// that doesn't already have one. Meta's insights rows have no natural id —
+// they're identified by the (ad, date range) tuple, not a resource id — so
+// both UpsertBatch's generic primary-key extraction and UpsertInsights's
+// own extractObjectID would otherwise reject every real row with "missing
+// id for insights", silently storing nothing even on a successful fetch.
+// The composite key mirrors what the row is actually unique by: the ad it
+// was fetched under plus its date_start (stable for the time_increment=1
+// daily series fatigue/decay/reconcile read; falls back to date_stop, then
+// the ad id alone, if a caller ever syncs insights without time_increment).
+//
+// Deliberately ad+date only, NOT ad+date+breakdown: insightsSyncFields never
+// requests a breakdown today, so every row for a given (ad, date) is already
+// unique under this key. If a future caller adds `breakdowns` to insights
+// sync params, multiple rows for the same ad/day (one per breakdown value)
+// would collide on this same id and silently overwrite each other in
+// UpsertBatch's ON CONFLICT upsert — extend the key with the breakdown
+// dimension(s) first. Flagged by review on
+// Bark-com/printing-press-library#3.
+func withSyntheticInsightsIDs(items []json.RawMessage, adID string) []json.RawMessage {
+	out := make([]json.RawMessage, len(items))
+	for i, raw := range items {
+		var obj map[string]any
+		if json.Unmarshal(raw, &obj) != nil {
+			out[i] = raw
+			continue
+		}
+		if _, hasID := obj["id"]; hasID {
+			out[i] = raw
+			continue
+		}
+		key := adID
+		if ds, ok := obj["date_start"].(string); ok && ds != "" {
+			key += "_" + ds
+		} else if de, ok := obj["date_stop"].(string); ok && de != "" {
+			key += "_" + de
+		}
+		obj["id"] = key
+		patched, err := json.Marshal(obj)
+		if err != nil {
+			out[i] = raw
+			continue
+		}
+		out[i] = patched
+	}
+	return out
 }
 
 // syncResource handles the full paginated sync of a single resource.
@@ -1199,6 +1713,12 @@ func defaultSyncResources() []string {
 func knownSyncResourceNames() []string {
 	names := []string{
 		"me",
+	}
+	for resource := range accountScopedCascadeResources {
+		names = append(names, resource)
+	}
+	for resource := range adScopedCascadeResources {
+		names = append(names, resource)
 	}
 	return names
 }
