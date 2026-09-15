@@ -202,9 +202,25 @@ Resource scoping:
 				concurrency = 1
 			}
 
+			// Bark fork addition (see accountScopedCascadeResources /
+			// adScopedCascadeResources doc comment below): the generated spec
+			// never wired path templates for these account/ad-nested
+			// resources, so they can't go through the flat worker pool above
+			// (syncResourcePath would reject them). Split them out and run
+			// them after the flat pool, in dependency order, feeding results
+			// through the same counters via accumulate().
+			var flatResources, cascadeResources []string
+			for _, resource := range resources {
+				if isCascadeResource(resource) {
+					cascadeResources = append(cascadeResources, resource)
+				} else {
+					flatResources = append(flatResources, resource)
+				}
+			}
+
 			started := time.Now()
-			work := make(chan string, len(resources))
-			results := make(chan syncResult, len(resources))
+			work := make(chan string, len(flatResources))
+			results := make(chan syncResult, len(flatResources))
 
 			var wg sync.WaitGroup
 			for i := 0; i < concurrency; i++ {
@@ -218,8 +234,8 @@ Resource scoping:
 				}()
 			}
 
-			// Enqueue all resources
-			for _, resource := range resources {
+			// Enqueue flat resources only; cascade resources run afterward.
+			for _, resource := range flatResources {
 				work <- resource
 			}
 			close(work)
@@ -237,7 +253,7 @@ Resource scoping:
 			var successCount int
 			var firstErr error
 			var firstPlaceholderErr error
-			for res := range results {
+			accumulate := func(res syncResult) {
 				if res.Err != nil {
 					if humanFriendly {
 						fmt.Fprintf(os.Stderr, "  %s: error: %v\n", res.Resource, res.Err)
@@ -263,6 +279,28 @@ Resource scoping:
 					}
 					totalSynced += res.Count
 					successCount++
+				}
+			}
+			for res := range results {
+				accumulate(res)
+			}
+
+			// Cascade resources run sequentially, account-scoped before
+			// ad-scoped (adcreatives/insights need the `ads` table populated
+			// first — either earlier in this loop or by a prior sync run).
+			for _, resource := range cascadeResources {
+				if pathTemplate, ok := accountScopedCascadeResources[resource]; ok {
+					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "me", "adAccountId", nil, syncEventWriter))
+				}
+			}
+			for _, resource := range cascadeResources {
+				if pathTemplate, ok := adScopedCascadeResources[resource]; ok {
+					extraParams := map[string]string{}
+					if resource == "insights" {
+						extraParams["fields"] = insightsSyncFields
+						extraParams["time_increment"] = "1"
+					}
+					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "ads", "adId", extraParams, syncEventWriter))
 				}
 			}
 
@@ -333,6 +371,188 @@ Resource scoping:
 	cmd.Flags().StringArrayVar(&globalParamFlags, "global-param", nil, "Extra query param to inject into every sync request including dependent path-scoped calls (repeatable, key=value). Use when an API requires a scope on every call regardless of path nesting.")
 
 	return cmd
+}
+
+// Bark fork addition (not upstream): the generated spec (CLI Printing
+// Press) emitted live-read commands and store upsert methods for these
+// resources but never wired sync path templates for them — see
+// https://github.com/mvanhorn/printing-press-library/issues/1434. Every
+// value here is copied verbatim from this same package's live-read
+// commands' `pp:path` annotation (promoted_campaigns.go, promoted_adsets.go,
+// promoted_ads.go, promoted_customaudiences.go, promoted_adcreatives.go,
+// insights_get-ad.go) so it can never drift from what the live tools
+// actually call.
+//
+// accountScopedCascadeResources are nested under /{adAccountId}/<resource>;
+// their parent rows come from the already-synced `me` table.
+var accountScopedCascadeResources = map[string]string{
+	"campaigns":       "/{adAccountId}/campaigns",
+	"adsets":          "/{adAccountId}/adsets",
+	"ads":             "/{adAccountId}/ads",
+	"customaudiences": "/{adAccountId}/customaudiences",
+}
+
+// adScopedCascadeResources are nested one level deeper, under
+// /{adId}/<resource>; their parent rows come from the `ads` table, which
+// must already be populated (accountScopedCascadeResources["ads"] earlier
+// in this same sync run, or a prior one).
+var adScopedCascadeResources = map[string]string{
+	"adcreatives": "/{adId}/adcreatives",
+	"insights":    "/{adId}/insights",
+}
+
+// insightsSyncFields requests the field set the fatigue/decay/reconcile
+// analysis commands actually read (impressions/spend/cpm/ctr/frequency for
+// fatigue+decay, actions/purchase_roas/action_values for reconcile) — the
+// bare insights endpoint defaults to spend+impressions only, which is why
+// those analysis commands found nothing even on a successful sync.
+const insightsSyncFields = "impressions,spend,cpm,ctr,frequency,reach,actions,purchase_roas,action_values"
+
+func isCascadeResource(resource string) bool {
+	if _, ok := accountScopedCascadeResources[resource]; ok {
+		return true
+	}
+	_, ok := adScopedCascadeResources[resource]
+	return ok
+}
+
+// syncCascadeResource syncs `resource` once per row already synced into
+// parentResourceType, substituting each row's id for parentIDPlaceholder in
+// pathTemplate.
+//
+// Pagination is delegated to paginatedGet(fetchAll=true) — the same,
+// already-tested function the live-read `--all` path uses (see
+// TestPaginatedGetAutoDetectsMetaGraphCursor) — rather than the generic
+// extractPageItems loop syncResource uses, because that generic loop does
+// not resolve Meta's actual paging.cursors.after shape (only paginatedGet's
+// PATCH(meta-graph-cursor-pagination) auto-detection does). Reusing it means
+// this cascade sync always does a full per-parent fetch on every run rather
+// than resuming from a persisted cursor — a deliberate simplification for
+// this fork-local fix: these resources synced *zero* rows before it, so
+// "correct and complete" matters more here than "incremental."
+func syncCascadeResource(ctx context.Context, c interface {
+	GetWithHeaders(ctx context.Context, path string, params map[string]string, headers map[string]string) (json.RawMessage, error)
+}, db *store.Store, resource, pathTemplate, parentResourceType, parentIDPlaceholder string, extraParams map[string]string, syncEvents io.Writer) syncResult {
+	started := time.Now()
+	if syncEvents == nil {
+		syncEvents = io.Discard
+	}
+
+	parentIDs, err := db.ListIDs(parentResourceType)
+	if err != nil {
+		return syncResult{Resource: resource, Err: fmt.Errorf("listing synced %s to scope %s: %w", parentResourceType, resource, err), Duration: time.Since(started)}
+	}
+	if len(parentIDs) == 0 {
+		msg := fmt.Sprintf("no synced %s rows found; run 'sync --resources %s' first", parentResourceType, parentResourceType)
+		if !humanFriendly {
+			fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","reason":"parent_not_synced","message":"%s"}`+"\n", resource, msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", resource, msg)
+		}
+		return syncResult{Resource: resource, Warn: errors.New(msg), Duration: time.Since(started)}
+	}
+
+	if !humanFriendly {
+		fmt.Fprintf(syncEvents, `{"event":"sync_start","resource":"%s","scoped_by":"%s","parents":%d}`+"\n", resource, parentResourceType, len(parentIDs))
+	}
+
+	limit := determinePaginationDefaults().limit
+	var totalCount int
+	var lastErr error
+
+	for _, parentID := range parentIDs {
+		path := replacePathParam(pathTemplate, parentIDPlaceholder, parentID)
+		params := map[string]string{"limit": strconv.Itoa(limit)}
+		for k, v := range extraParams {
+			params[k] = v
+		}
+
+		data, err := paginatedGet(ctx, c, path, params, nil, true, "after", "offset", "limit", "paging.cursors.after", "")
+		if err != nil {
+			if w, ok := isSyncAccessWarning(err); ok {
+				if !humanFriendly {
+					fmt.Fprintf(syncEvents, `{"event":"sync_warning","resource":"%s","parent_id":"%s","status":%d,"reason":"%s"}`+"\n", resource, parentID, w.Status, w.Reason)
+				}
+				continue
+			}
+			lastErr = fmt.Errorf("fetching %s for %s %s: %w", resource, parentIDPlaceholder, parentID, err)
+			if !humanFriendly {
+				fmt.Fprintln(syncEvents, syncErrorJSON(resource, parentID, lastErr))
+			}
+			continue
+		}
+
+		var items []json.RawMessage
+		if err := json.Unmarshal(data, &items); err != nil || len(items) == 0 {
+			continue
+		}
+		if resource == "insights" {
+			items = withSyntheticInsightsIDs(items, parentID)
+		}
+
+		stored, _, err := db.UpsertBatch(resource, items)
+		if err != nil {
+			lastErr = fmt.Errorf("upserting %s for %s %s: %w", resource, parentIDPlaceholder, parentID, err)
+			if !humanFriendly {
+				fmt.Fprintln(syncEvents, syncErrorJSON(resource, parentID, lastErr))
+			}
+			continue
+		}
+		totalCount += stored
+	}
+
+	// No resumable cursor for cascade resources (see doc comment above) —
+	// still record a sync_state row so `workflow_status` reports something
+	// other than "never synced".
+	_ = db.SaveSyncState(resource, "", totalCount)
+
+	if !humanFriendly {
+		fmt.Fprintf(syncEvents, `{"event":"sync_complete","resource":"%s","total":%d,"duration_ms":%d}`+"\n", resource, totalCount, time.Since(started).Milliseconds())
+	}
+
+	if lastErr != nil && totalCount == 0 {
+		return syncResult{Resource: resource, Err: lastErr, Duration: time.Since(started)}
+	}
+	return syncResult{Resource: resource, Count: totalCount, Duration: time.Since(started)}
+}
+
+// withSyntheticInsightsIDs injects an "id" field into each insights item
+// that doesn't already have one. Meta's insights rows have no natural id —
+// they're identified by the (ad, date range) tuple, not a resource id — so
+// both UpsertBatch's generic primary-key extraction and UpsertInsights's
+// own extractObjectID would otherwise reject every real row with "missing
+// id for insights", silently storing nothing even on a successful fetch.
+// The composite key mirrors what the row is actually unique by: the ad it
+// was fetched under plus its date_start (stable for the time_increment=1
+// daily series fatigue/decay/reconcile read; falls back to date_stop, then
+// the ad id alone, if a caller ever syncs insights without time_increment).
+func withSyntheticInsightsIDs(items []json.RawMessage, adID string) []json.RawMessage {
+	out := make([]json.RawMessage, len(items))
+	for i, raw := range items {
+		var obj map[string]any
+		if json.Unmarshal(raw, &obj) != nil {
+			out[i] = raw
+			continue
+		}
+		if _, hasID := obj["id"]; hasID {
+			out[i] = raw
+			continue
+		}
+		key := adID
+		if ds, ok := obj["date_start"].(string); ok && ds != "" {
+			key += "_" + ds
+		} else if de, ok := obj["date_stop"].(string); ok && de != "" {
+			key += "_" + de
+		}
+		obj["id"] = key
+		patched, err := json.Marshal(obj)
+		if err != nil {
+			out[i] = raw
+			continue
+		}
+		out[i] = patched
+	}
+	return out
 }
 
 // syncResource handles the full paginated sync of a single resource.
@@ -1199,6 +1419,12 @@ func defaultSyncResources() []string {
 func knownSyncResourceNames() []string {
 	names := []string{
 		"me",
+	}
+	for resource := range accountScopedCascadeResources {
+		names = append(names, resource)
+	}
+	for resource := range adScopedCascadeResources {
+		names = append(names, resource)
 	}
 	return names
 }
