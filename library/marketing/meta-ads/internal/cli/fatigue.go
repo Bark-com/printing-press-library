@@ -102,8 +102,19 @@ Requires synced ad-level insights with time_increment=1 in the local store.`,
 				adQuery += ` AND json_extract(data, '$.campaign_id') = ?`
 				adArgs = append(adArgs, flagCampaign)
 			} else if flagAccount != "" {
-				adQuery += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.id') LIKE ?)`
-				adArgs = append(adArgs, flagAccount, flagAccount+"%")
+				// Bark fork fix: account_id is stored bare-numeric (Meta's
+				// convention — confirmed live), but --account is passed
+				// "act_"-prefixed (matching every other --account flag in
+				// this CLI), so a plain `= ?` never matched, silently
+				// returning zero ads on a fully-backfilled account.
+				// Mirrors reconcile.go's existing account_id ==
+				// "act_"+account_id handling for the identical ambiguity.
+				// (The previous `json_extract(data,'$.id') LIKE ?` fallback
+				// is removed: an ad's own id is never prefixed by its
+				// account id, so it could never match either.)
+				bareAccount := strings.TrimPrefix(flagAccount, "act_")
+				adQuery += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.account_id') = ?)`
+				adArgs = append(adArgs, flagAccount, bareAccount)
 			}
 			adRows, err := db.DB().QueryContext(cmd.Context(), adQuery, adArgs...)
 			if err != nil {

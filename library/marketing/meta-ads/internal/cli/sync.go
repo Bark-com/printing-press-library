@@ -310,9 +310,21 @@ Resource scoping:
 			// first — either earlier in this loop or by a prior sync run).
 			for _, resource := range cascadeResources {
 				if pathTemplate, ok := accountScopedCascadeResources[resource]; ok {
-					var extraParams map[string]string
-					if fields, ok := accountScopedSyncFields[resource]; ok {
-						extraParams = map[string]string{"fields": fields}
+					extraParams := map[string]string{}
+					switch {
+					case resource == "insights":
+						// Account-scoped sibling of the ad-scoped insights
+						// sync below — see accountInsightsSyncFields's doc
+						// comment for why this is what unblocks reconcile.
+						extraParams["fields"] = accountInsightsSyncFields
+						extraParams["time_increment"] = "1"
+					default:
+						if fields, ok := accountScopedSyncFields[resource]; ok {
+							extraParams["fields"] = fields
+						}
+					}
+					if len(extraParams) == 0 {
+						extraParams = nil
 					}
 					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "me", "adAccountId", extraParams, concurrency, syncEventWriter))
 				}
@@ -320,9 +332,12 @@ Resource scoping:
 			for _, resource := range cascadeResources {
 				if pathTemplate, ok := adScopedCascadeResources[resource]; ok {
 					extraParams := map[string]string{}
-					if resource == "insights" {
+					switch resource {
+					case "insights":
 						extraParams["fields"] = insightsSyncFields
 						extraParams["time_increment"] = "1"
+					case "adcreatives":
+						extraParams["fields"] = adcreativesSyncFields
 					}
 					accumulate(syncCascadeResource(cmd.Context(), c, db, resource, pathTemplate, "ads", "adId", extraParams, concurrency, syncEventWriter))
 				}
@@ -415,11 +430,19 @@ Resource scoping:
 //
 // accountScopedCascadeResources are nested under /{adAccountId}/<resource>;
 // their parent rows come from the already-synced `me` table.
+// insights appears here AND in adScopedCascadeResources below — deliberately,
+// not a collision: they're separate maps, so a single "insights" sync
+// request runs BOTH the account-scoped fetch (this map, populating
+// reconcile's account-side of its drift comparison) and the ad-scoped one
+// (adScopedCascadeResources, populating fatigue/decay/reconcile's ad-side),
+// writing to the same table distinguished by whether ad_id is present —
+// exactly the shape reconcile.go's SQL already expects.
 var accountScopedCascadeResources = map[string]string{
 	"campaigns":       "/{adAccountId}/campaigns",
 	"adsets":          "/{adAccountId}/adsets",
 	"ads":             "/{adAccountId}/ads",
 	"customaudiences": "/{adAccountId}/customaudiences",
+	"insights":        "/{adAccountId}/insights",
 }
 
 // adScopedCascadeResources are nested one level deeper, under
@@ -476,12 +499,43 @@ const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,sp
 // exactly why bottleneck/learning/inventory (which scope by those columns)
 // reported "no adsets/ads in local store" despite a successful sync. Same
 // bug class as insightsSyncFields above, just missed here the first time.
+// ads additionally requests account_id and creative — confirmed missing
+// live, each breaking a different analysis tool:
+//   - account_id: fatigue's --account scope path queries
+//     json_extract(data,'$.account_id') on synced ads; without requesting
+//     the field it's always NULL, so --account silently matched zero ads
+//     even on a fully-backfilled account (--campaign worked fine, since
+//     campaign_id was already requested).
+//   - creative: decay resolves creative->ads via
+//     json_extract(data,'$.creative.id') / '$.creative.creative_id') on
+//     synced ads (it never reads the adcreatives table at all) — without
+//     requesting the field, every ad's decay lookup silently matches
+//     nothing regardless of backfill completeness.
 var accountScopedSyncFields = map[string]string{
 	"campaigns":       "id,name,objective,status,effective_status",
 	"adsets":          "id,name,campaign_id,status,effective_status",
-	"ads":             "id,name,adset_id,campaign_id,status,effective_status",
+	"ads":             "id,name,adset_id,campaign_id,account_id,creative,status,effective_status",
 	"customaudiences": "id,name,subtype,description,approximate_count_lower_bound,approximate_count_upper_bound,time_created,time_updated",
 }
+
+// adcreativesSyncFields requests the fields upsertAdcreativesTx's domain
+// columns actually store (body/call_to_action_type/
+// effective_object_story_id/image_url/name/object_type/thumbnail_url/
+// title) — confirmed missing live: with no fields requested, Meta
+// returned bare id only, leaving every other column NULL.
+const adcreativesSyncFields = "id,name,title,body,image_url,thumbnail_url,object_type,call_to_action_type,effective_object_story_id"
+
+// accountInsightsSyncFields is the account-scoped sibling of
+// insightsSyncFields, deliberately omitting ad_id/adset_id/campaign_id —
+// reconcile.go partitions the shared `insights` resource_type table into
+// "account-level" vs "ad-level" purely by whether ad_id is present
+// (`json_extract(data,'$.ad_id') IS NULL OR = ''`), so a row synced with
+// this field list is exactly what reconcile expects for the account side
+// of its drift comparison. Before this, nothing ever populated that side
+// at all — confirmed live: reconcile's account_spend read 0 on every day
+// despite a full ad-level insights backfill, because there was no sync
+// path for account-scoped insights, only ad-scoped.
+const accountInsightsSyncFields = "account_id,impressions,spend,cpm,ctr,frequency,reach,actions,purchase_roas,action_values"
 
 func isCascadeResource(resource string) bool {
 	if _, ok := accountScopedCascadeResources[resource]; ok {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/mvanhorn/printing-press-library/library/marketing/meta-ads/internal/store"
 
@@ -88,8 +89,17 @@ Requires synced account-level and ad-level insights with time_increment=1.`,
 			accountFilter := ""
 			queryArgs := []any{fmt.Sprintf("-%d days", sinceDays)}
 			if flagAccount != "" {
-				accountFilter = ` AND json_extract(data, '$.account_id') = ?`
-				queryArgs = append(queryArgs, flagAccount)
+				// Bark fork fix: account_id is stored bare-numeric (Meta's
+				// convention), but --account is passed "act_"-prefixed —
+				// matches the same ambiguity this file already handles
+				// correctly in Go for the ad-level rows below (raw.AccountID
+				// != flagAccount && "act_"+raw.AccountID != flagAccount);
+				// this SQL-level filter for the account-side query had been
+				// missed, so account_spend read 0 on every day even once
+				// account-level insights were syncable at all.
+				bareAccount := strings.TrimPrefix(flagAccount, "act_")
+				accountFilter = ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.account_id') = ?)`
+				queryArgs = append(queryArgs, flagAccount, bareAccount)
 			}
 
 			// account-level spend per day

@@ -441,3 +441,63 @@ func TestOrderCascadeCandidates_NeverFetchedBeforeStale(t *testing.T) {
 		}
 	}
 }
+
+// TestAccountScopedSyncFields_AdsCarriesFatigueAndDecayLinkage guards the
+// two fields confirmed missing live: fatigue's --account scope needs
+// account_id on synced ads, decay's creative->ads lookup needs creative.
+func TestAccountScopedSyncFields_AdsCarriesFatigueAndDecayLinkage(t *testing.T) {
+	fields, ok := accountScopedSyncFields["ads"]
+	if !ok {
+		t.Fatalf("accountScopedSyncFields has no entry for ads")
+	}
+	for _, want := range []string{"account_id", "creative"} {
+		if !strings.Contains(fields, want) {
+			t.Fatalf("ads fields = %q, missing %q — fatigue --account or decay would regress to matching nothing", fields, want)
+		}
+	}
+}
+
+// TestAccountInsightsSyncFields_OmitsAdLinkage guards the mechanism
+// reconcile.go depends on: it partitions the shared `insights` table into
+// account-level vs ad-level purely by whether ad_id/adset_id/campaign_id
+// are present. If any of those ever leaked into
+// accountInsightsSyncFields, account-scoped rows would misclassify as
+// ad-level and reconcile's drift comparison would silently double-count.
+func TestAccountInsightsSyncFields_OmitsAdLinkage(t *testing.T) {
+	for _, forbidden := range []string{"ad_id", "adset_id", "campaign_id"} {
+		if strings.Contains(accountInsightsSyncFields, forbidden) {
+			t.Fatalf("accountInsightsSyncFields = %q must not contain %q — would break reconcile's ad_id-based account/ad partitioning", accountInsightsSyncFields, forbidden)
+		}
+	}
+	if !strings.Contains(accountInsightsSyncFields, "account_id") {
+		t.Fatalf("accountInsightsSyncFields = %q missing account_id — reconcile's --account filter needs it", accountInsightsSyncFields)
+	}
+}
+
+// TestSyncCascadeResource_AdScoped_AdcreativesUsesFieldList verifies
+// adcreatives sync actually requests adcreativesSyncFields end to end —
+// confirmed live that with no fields requested, Meta returned bare id
+// only, leaving every display/lookup field NULL.
+func TestSyncCascadeResource_AdScoped_AdcreativesUsesFieldList(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.UpsertAds(json.RawMessage(`{"id":"ad1","name":"Ad One"}`)); err != nil {
+		t.Fatalf("seed ads: %v", err)
+	}
+
+	wantKey := "/ad1/adcreatives|limit=100|fields=" + adcreativesSyncFields
+	client := &fakeHeadersClient{responses: map[string]json.RawMessage{
+		wantKey: json.RawMessage(`[{"id":"cr1","name":"Creative One","image_url":"https://example.test/1.jpg"}]`),
+	}}
+
+	res := syncCascadeResource(context.Background(), client, db, "adcreatives", "/{adId}/adcreatives", "ads",
+		"adId", map[string]string{"fields": adcreativesSyncFields}, 1, io.Discard)
+	if res.Err != nil {
+		t.Fatalf("syncCascadeResource returned error: %v", res.Err)
+	}
+	if res.Count != 1 {
+		t.Fatalf("count = %d, want 1", res.Count)
+	}
+	if len(client.calls) != 1 || client.calls[0] != wantKey {
+		t.Fatalf("calls = %v, want [%q]", client.calls, wantKey)
+	}
+}
