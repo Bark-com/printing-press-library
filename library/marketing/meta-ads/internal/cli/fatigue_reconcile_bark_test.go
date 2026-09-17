@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,6 +149,81 @@ func TestStaleAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
 	}
 	if view.Total != 1 {
 		t.Fatalf("total = %d, want 1 — account-scope match regressed. raw: %s", view.Total, out.String())
+	}
+}
+
+// TestBottleneckAccountScope_MatchesBarePrefixedAccountID: bottleneck
+// filters adsets (not ads) by account_id — a field that, unlike ads',
+// hadn't been added to accountScopedSyncFields at all until this test's
+// bug was found: the earlier act_-prefix SQL fix alone did NOT unblock
+// --account here, because the underlying field was simply never
+// requested from Meta. Full integration test (not just a field-list
+// guard) specifically because that gap survived one whole round of "fix
+// the query" without being caught.
+func TestBottleneckAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.Upsert("adsets", "as1", json.RawMessage(`{"id":"as1","name":"Adset One","campaign_id":"c1","account_id":"992420150824125","effective_status":"ACTIVE"}`)); err != nil {
+		t.Fatalf("seed adset: %v", err)
+	}
+
+	flags := &rootFlags{asJSON: true}
+	cmd := newNovelBottleneckCmd(flags)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--account", "act_992420150824125", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("bottleneck --account failed: %v", err)
+	}
+
+	var view bottleneckView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.Total != 1 {
+		t.Fatalf("total = %d, want 1 — account-scope match regressed (missing account_id field on synced adsets, or the act_-prefix bug). raw: %s", view.Total, out.String())
+	}
+}
+
+// TestLearningAccountScope_MatchesBarePrefixedAccountID: same root cause
+// as bottleneck above — learning also filters adsets by account_id.
+func TestLearningAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
+	db := newTestStore(t)
+	// No start_time: hits learning.go's "missing start_time sentinel" path
+	// (daysInLearning == -1), which is kept regardless of --min-days —
+	// avoids the test depending on wall-clock date math.
+	if err := db.Upsert("adsets", "as1", json.RawMessage(`{"id":"as1","name":"Adset One","campaign_id":"c1","account_id":"992420150824125","learning_stage_info":{"status":"LEARNING"}}`)); err != nil {
+		t.Fatalf("seed adset: %v", err)
+	}
+
+	flags := &rootFlags{asJSON: true}
+	cmd := newNovelLearningCmd(flags)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--account", "act_992420150824125", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("learning --account failed: %v", err)
+	}
+
+	var view learningView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.Total != 1 {
+		t.Fatalf("total = %d, want 1 — account-scope match regressed. raw: %s", view.Total, out.String())
+	}
+}
+
+// TestAccountScopedSyncFields_AdsetsCarriesAccountID guards the field this
+// round's live testing found missing: bottleneck/learning both filter
+// synced adsets by account_id, which accountScopedSyncFields["adsets"]
+// never requested.
+func TestAccountScopedSyncFields_AdsetsCarriesAccountID(t *testing.T) {
+	fields, ok := accountScopedSyncFields["adsets"]
+	if !ok {
+		t.Fatalf("accountScopedSyncFields has no entry for adsets")
+	}
+	if !strings.Contains(fields, "account_id") {
+		t.Fatalf("adsets fields = %q, missing account_id — bottleneck/learning --account would regress to matching nothing", fields)
 	}
 }
 

@@ -511,9 +511,18 @@ const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,sp
 //     synced ads (it never reads the adcreatives table at all) — without
 //     requesting the field, every ad's decay lookup silently matches
 //     nothing regardless of backfill completeness.
+//
+// adsets additionally requests account_id — confirmed missing live: with
+// the act_-prefix query fix already applied to bottleneck.go/learning.go
+// (both filter adsets by account_id for --account), --account still
+// matched nothing, because the underlying field had never been requested
+// at all — same missing-field bug class, one level removed from the
+// account/ad ones, just discovered a round later since ads' account_id
+// masked the general pattern until adsets was actually exercised with
+// --account.
 var accountScopedSyncFields = map[string]string{
 	"campaigns":       "id,name,objective,status,effective_status",
-	"adsets":          "id,name,campaign_id,status,effective_status",
+	"adsets":          "id,name,campaign_id,account_id,status,effective_status",
 	"ads":             "id,name,adset_id,campaign_id,account_id,creative,status,effective_status",
 	"customaudiences": "id,name,subtype,description,approximate_count_lower_bound,approximate_count_upper_bound,time_created,time_updated",
 }
