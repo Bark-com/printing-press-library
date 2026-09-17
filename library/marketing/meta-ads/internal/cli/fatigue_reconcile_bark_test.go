@@ -96,6 +96,61 @@ func TestReconcileAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
 	}
 }
 
+// TestInventoryAccountScope_MatchesBarePrefixedAccountID reproduces the
+// marketing team's exact live report: "the account filter on inventory
+// returns nothing." Same act_-prefix bug as fatigue/reconcile, just in a
+// fourth (of five total) copy-pasted occurrence.
+func TestInventoryAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.Upsert("ads", "ad1", json.RawMessage(`{"id":"ad1","account_id":"992420150824125","effective_status":"WITH_ISSUES","status":"ACTIVE"}`)); err != nil {
+		t.Fatalf("seed ad: %v", err)
+	}
+
+	flags := &rootFlags{asJSON: true}
+	cmd := newNovelInventoryCmd(flags)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--account", "act_992420150824125", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("inventory --account failed: %v", err)
+	}
+
+	var view inventoryView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.TotalAds != 1 {
+		t.Fatalf("total_ads = %d, want 1 — account-scope match regressed (this is the exact bug the marketing team reported). raw: %s", view.TotalAds, out.String())
+	}
+}
+
+// TestStaleAccountScope_MatchesBarePrefixedAccountID: same bug, fifth
+// occurrence.
+func TestStaleAccountScope_MatchesBarePrefixedAccountID(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.Upsert("ads", "ad1", json.RawMessage(`{"id":"ad1","account_id":"992420150824125","status":"ACTIVE"}`)); err != nil {
+		t.Fatalf("seed ad: %v", err)
+	}
+	// No insights rows at all -> zero impressions in the window -> stale.
+
+	flags := &rootFlags{asJSON: true}
+	cmd := newNovelStaleCmd(flags)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--account", "act_992420150824125", "--days", "90", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("stale --account failed: %v", err)
+	}
+
+	var view staleView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.Total != 1 {
+		t.Fatalf("total = %d, want 1 — account-scope match regressed. raw: %s", view.Total, out.String())
+	}
+}
+
 // TestOverlap_ReportsNotAvailableViaAPI verifies overlap reports the
 // honest, actionable verdict — confirmed against Meta's current Custom
 // Audience API reference that no overlap or membership data is exposed at

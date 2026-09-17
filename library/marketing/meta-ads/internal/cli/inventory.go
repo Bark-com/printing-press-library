@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/mvanhorn/printing-press-library/library/marketing/meta-ads/internal/store"
 
@@ -79,8 +80,17 @@ Requires 'meta-ads-pp-cli sync' to have populated the local store with ads first
 				WHERE resource_type IN ('ads', 'adaccounts_ads', 'ad_accounts_ads')`
 			queryArgs := []any{}
 			if flagAccount != "" {
-				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.id') LIKE ?)`
-				queryArgs = append(queryArgs, flagAccount, flagAccount+"%")
+				// Bark fork fix: confirmed live by the marketing team —
+				// "the account filter on inventory returns nothing." Same
+				// copy-pasted act_-prefix bug as fatigue.go/bottleneck.go/
+				// stale.go/learning.go: account_id is stored bare-numeric
+				// (Meta's convention) but --account is passed
+				// act_-prefixed, so a plain `= ?` never matched, even
+				// against a fully-synced account. See fatigue.go's fix
+				// comment for the full explanation.
+				bareAccount := strings.TrimPrefix(flagAccount, "act_")
+				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.account_id') = ?)`
+				queryArgs = append(queryArgs, flagAccount, bareAccount)
 			}
 
 			rows, err := db.DB().QueryContext(cmd.Context(), query, queryArgs...)

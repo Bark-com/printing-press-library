@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/mvanhorn/printing-press-library/library/marketing/meta-ads/internal/store"
 
@@ -78,8 +79,14 @@ current insights.`,
 				  AND json_extract(data, '$.status') = 'ACTIVE'`
 			queryArgs := []any{}
 			if flagAccount != "" {
-				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.id') LIKE ?)`
-				queryArgs = append(queryArgs, flagAccount, flagAccount+"%")
+				// Bark fork fix: same copy-pasted act_-prefix bug as
+				// fatigue.go/bottleneck.go/learning.go/inventory.go —
+				// account_id is stored bare-numeric but --account is
+				// act_-prefixed, so a plain `= ?` never matched. See
+				// fatigue.go's fix comment for the full explanation.
+				bareAccount := strings.TrimPrefix(flagAccount, "act_")
+				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.account_id') = ?)`
+				queryArgs = append(queryArgs, flagAccount, bareAccount)
 			}
 
 			rows, err := db.DB().QueryContext(cmd.Context(), query, queryArgs...)

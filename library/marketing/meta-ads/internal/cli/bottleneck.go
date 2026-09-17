@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/mvanhorn/printing-press-library/library/marketing/meta-ads/internal/store"
 
@@ -83,8 +84,20 @@ Requires synced adsets and insights data in the local store.`,
 				WHERE resource_type IN ('adsets', 'adaccounts_adsets', 'ad_accounts_adsets')`
 			queryArgs := []any{}
 			if flagAccount != "" {
-				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.id') LIKE ?)`
-				queryArgs = append(queryArgs, flagAccount, flagAccount+"%")
+				// Bark fork fix: account_id is stored bare-numeric (Meta's
+				// convention — confirmed live), but --account is passed
+				// "act_"-prefixed, so a plain `= ?` never matched, silently
+				// returning zero rows on a fully-backfilled account. Mirrors
+				// reconcile.go's existing account_id == "act_"+account_id
+				// handling for the identical ambiguity, and the identical
+				// fix already applied to fatigue.go/stale.go/learning.go/
+				// inventory.go — same copy-pasted bug in all five. (The
+				// previous `json_extract(data,'$.id') LIKE ?` fallback is
+				// removed: an ad's own id is never prefixed by its account
+				// id, so it could never match either.)
+				bareAccount := strings.TrimPrefix(flagAccount, "act_")
+				query += ` AND (json_extract(data, '$.account_id') = ? OR json_extract(data, '$.account_id') = ?)`
+				queryArgs = append(queryArgs, flagAccount, bareAccount)
 			}
 
 			rows, err := db.DB().QueryContext(cmd.Context(), query, queryArgs...)
