@@ -148,13 +148,17 @@ func TestSyncCascadeResource_AccountScopedFields(t *testing.T) {
 
 // TestAccountScopedSyncFields_NoFinancialFields is a cheap guard against
 // reintroducing the exact class of bug this was added to fix: none of
-// these field lists should request budget/financial fields, or fields
-// touching audience membership/targeting/data-source, which are the kind
-// of field Meta gates behind more than ads_read (ads_management, for
-// customaudiences).
+// these field lists should request fields touching audience membership/
+// targeting/data-source, or additional financial fields beyond
+// daily_budget (which learning.go's why-hint genuinely needs — no direct
+// evidence daily_budget itself was ever the field that required more than
+// ads_read in the original unfielded-default-request failure, only that
+// *some* field in Meta's default set did; unlike the others in this
+// list, this one is a real, confirmed dependency, not a defensive
+// guess — verify live on next deploy same as everything else here).
 func TestAccountScopedSyncFields_NoFinancialFields(t *testing.T) {
 	suspect := []string{
-		"budget", "daily_budget", "lifetime_budget", "budget_remaining", "spend_cap",
+		"lifetime_budget", "budget_remaining", "spend_cap",
 		"rule", "data_source", "subscription_info", "lookalike_spec",
 	}
 	for resource, fields := range accountScopedSyncFields {

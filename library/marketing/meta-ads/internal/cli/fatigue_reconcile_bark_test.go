@@ -7,8 +7,10 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -255,5 +257,159 @@ func TestOverlap_ReportsNotAvailableViaAPI(t *testing.T) {
 	}
 	if view.Note == "" {
 		t.Fatalf("expected a top-level Note explaining the structural API limitation, got none")
+	}
+}
+
+// fieldFilteringClient simulates Meta's actual "fields are authoritative"
+// behavior: a response only contains exactly the fields listed in the
+// request's `fields` param (plus id, which Meta always includes). This is
+// what actually catches "a field is missing from the sync field list"
+// bugs — unlike a hand-seeded test fixture that already has every field
+// present regardless of what sync would really have requested, which is
+// exactly how the learning_stage_info/daily_budget/start_time and clicks
+// gaps survived two earlier rounds of tests that seeded fixtures directly.
+type fieldFilteringClient struct {
+	responses map[string]map[string]any // full, unfiltered field set per path
+	calls     []string
+}
+
+func (f *fieldFilteringClient) GetWithHeaders(_ context.Context, path string, params map[string]string, _ map[string]string) (json.RawMessage, error) {
+	f.calls = append(f.calls, path)
+	full, ok := f.responses[path]
+	if !ok {
+		return json.RawMessage(`[]`), nil
+	}
+	requested := map[string]bool{"id": true} // Meta always includes id
+	for _, field := range strings.Split(params["fields"], ",") {
+		requested[field] = true
+	}
+	filtered := map[string]any{}
+	for k, v := range full {
+		if requested[k] {
+			filtered[k] = v
+		}
+	}
+	data, err := json.Marshal([]map[string]any{filtered})
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(data), nil
+}
+
+// TestSyncThenLearning_EndToEnd_CatchesMissingFieldGaps is the real
+// regression guard for the learning_stage_info/daily_budget/start_time
+// gap: it runs the actual sync cascade with the real
+// accountScopedSyncFields["adsets"] list against a client that only
+// returns what was actually requested, then runs the real `learning`
+// command against the resulting store. A future removal of any field
+// learning.go depends on fails this test; a hand-seeded fixture would not.
+func TestSyncThenLearning_EndToEnd_CatchesMissingFieldGaps(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.UpsertMe(json.RawMessage(`{"id":"act_1","name":"acct"}`)); err != nil {
+		t.Fatalf("seed me: %v", err)
+	}
+
+	client := &fieldFilteringClient{responses: map[string]map[string]any{
+		"/act_1/adsets": {
+			"id": "as1", "name": "Adset One", "campaign_id": "c1", "account_id": "1",
+			"learning_stage_info": map[string]any{"status": "LEARNING"},
+			"daily_budget":        "5000",
+			"status":              "ACTIVE", "effective_status": "ACTIVE",
+		},
+	}}
+
+	fields := accountScopedSyncFields["adsets"]
+	syncRes := syncCascadeResource(context.Background(), client, db, "adsets", "/{adAccountId}/adsets", "me", "adAccountId",
+		map[string]string{"fields": fields}, 1, io.Discard)
+	if syncRes.Err != nil {
+		t.Fatalf("sync adsets failed: %v", syncRes.Err)
+	}
+	if syncRes.Count != 1 {
+		t.Fatalf("sync adsets stored %d rows, want 1", syncRes.Count)
+	}
+
+	cmd := newNovelLearningCmd(&rootFlags{asJSON: true})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--account", "act_1", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("learning --account failed: %v", err)
+	}
+
+	var view learningView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.Total != 1 {
+		t.Fatalf("learning found %d adsets after a real sync (want 1) — accountScopedSyncFields[\"adsets\"] is missing a field learning.go needs. raw: %s", view.Total, out.String())
+	}
+}
+
+// TestSyncThenDecay_EndToEnd_CatchesMissingClicksField is the real
+// regression guard for decay's clicks gap: runs the actual ads+insights
+// sync cascade with the real field lists against a client that only
+// returns what was requested, then runs the real `decay` command. Without
+// clicks in insightsSyncFields, decay's CTR always computes as 0/impressions
+// = 0 regardless of real data — this test asserts a nonzero CTR instead.
+func TestSyncThenDecay_EndToEnd_CatchesMissingClicksField(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.UpsertMe(json.RawMessage(`{"id":"act_1","name":"acct"}`)); err != nil {
+		t.Fatalf("seed me: %v", err)
+	}
+
+	client := &fieldFilteringClient{responses: map[string]map[string]any{
+		"/act_1/ads": {
+			"id": "ad1", "name": "Ad One", "adset_id": "as1", "campaign_id": "c1", "account_id": "1",
+			"creative": map[string]any{"id": "cr1"},
+			"status":   "ACTIVE", "effective_status": "ACTIVE",
+		},
+		"/ad1/insights": {
+			"ad_id": "ad1", "date_start": "2026-09-01", "date_stop": "2026-09-01",
+			"impressions": "1000", "clicks": "50", "spend": "10.00",
+		},
+	}}
+
+	adsFields := accountScopedSyncFields["ads"]
+	adsRes := syncCascadeResource(context.Background(), client, db, "ads", "/{adAccountId}/ads", "me", "adAccountId",
+		map[string]string{"fields": adsFields}, 1, io.Discard)
+	if adsRes.Err != nil || adsRes.Count != 1 {
+		t.Fatalf("sync ads: count=%d err=%v", adsRes.Count, adsRes.Err)
+	}
+
+	// This day goes through the real sync path with the real
+	// insightsSyncFields list — the actual thing under test: does that
+	// field list, round-tripped through a client that only returns what
+	// was requested, still carry clicks?
+	insightsRes := syncCascadeResource(context.Background(), client, db, "insights", "/{adId}/insights", "ads", "adId",
+		map[string]string{"fields": insightsSyncFields, "time_increment": "1"}, 1, io.Discard)
+	if insightsRes.Err != nil || insightsRes.Count != 1 {
+		t.Fatalf("sync insights: count=%d err=%v", insightsRes.Count, insightsRes.Err)
+	}
+	// decay needs >= 2 days to compute a slope; a second day is upserted
+	// directly rather than round-tripped through the fake client a second
+	// time (fieldFilteringClient models one fixed response per path, and
+	// the field-list claim under test is already covered by the day above).
+	if err := db.Upsert("insights", "ad1_2026-09-02",
+		json.RawMessage(`{"id":"ad1_2026-09-02","ad_id":"ad1","date_start":"2026-09-02","date_stop":"2026-09-02","impressions":"1000","clicks":"50","spend":"10.00"}`)); err != nil {
+		t.Fatalf("seed second insights day: %v", err)
+	}
+
+	cmd := newNovelDecayCmd(&rootFlags{asJSON: true})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--creative-id", "cr1", "--db", db.Path()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("decay --creative-id failed: %v", err)
+	}
+
+	var view decayView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("unmarshal output: %v, raw: %s", err, out.String())
+	}
+	if view.Verdict == "no-data" {
+		t.Fatalf("decay found no data after a real sync — creative->ads lookup regressed. raw: %s", out.String())
+	}
+	if view.FirstCtr == 0 {
+		t.Fatalf("first_ctr = 0, want 5.0 (50 clicks / 1000 impressions * 100) — clicks is missing from insightsSyncFields again. raw: %s", out.String())
 	}
 }

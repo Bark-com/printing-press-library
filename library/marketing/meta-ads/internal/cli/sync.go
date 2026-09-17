@@ -467,7 +467,15 @@ var adScopedCascadeResources = map[string]string{
 // columns land NULL, and fatigue/decay/reconcile (which query by those
 // columns) can't match the very rows this sync exists to populate. Flagged
 // by review on Bark-com/printing-press-library#3.
-const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,spend,cpm,ctr,frequency,reach,actions,purchase_roas,action_values"
+//
+// Also requests clicks: found via full field-audit (not live testing) —
+// decay.go computes CTR itself from raw clicks/impressions
+// (float64(p.clicks)/float64(p.impressions)*100.0), it does NOT read the
+// pre-computed ctr field despite ctr already being in this list for
+// fatigue's own slope calc. Without clicks, decay's CTR always computes as
+// 0 regardless of real Meta data, even after the creative->ads lookup
+// (fixed separately below) starts finding the right ads.
+const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,clicks,spend,cpm,ctr,frequency,reach,actions,purchase_roas,action_values"
 
 // accountScopedSyncFields requests an explicit, minimal field set for the
 // account-scoped resources instead of none at all. Omitting `fields`
@@ -520,10 +528,30 @@ const insightsSyncFields = "ad_id,adset_id,campaign_id,account_id,impressions,sp
 // account/ad ones, just discovered a round later since ads' account_id
 // masked the general pattern until adsets was actually exercised with
 // --account.
+//
+// adsets also requests learning_stage_info, daily_budget, and start_time
+// — found via full field-audit after the account_id gap above, not live
+// testing (do NOT assume "found live" means "the audit is now complete";
+// these came from reading every json_extract/json-tag in every analysis
+// command against what's actually requested). learning_stage_info is not
+// optional: learning.go's SQL WHERE clause hard-filters on
+// json_extract(data,'$.learning_stage_info.status') = 'LEARNING' — without
+// requesting the field, that condition can never be true, so `learning`
+// would return zero rows on any real account regardless of the account-id
+// fix. bottleneck.go also reads learning_stage_info.status for its
+// "stuck-in-learning" why-hint (soft dependency: without it bottleneck
+// still returns rows, just never with that why value). daily_budget and
+// start_time feed learning.go's why_hint and days-in-learning calc
+// respectively — both silently blank/unset without this.
+//
+// ads also requests updated_time — stale.go's output struct has an
+// UpdatedTime field that was always going to render empty; cosmetic only
+// (not used in any filter), included here for the same completeness
+// reason as the rest of this audit.
 var accountScopedSyncFields = map[string]string{
 	"campaigns":       "id,name,objective,status,effective_status",
-	"adsets":          "id,name,campaign_id,account_id,status,effective_status",
-	"ads":             "id,name,adset_id,campaign_id,account_id,creative,status,effective_status",
+	"adsets":          "id,name,campaign_id,account_id,learning_stage_info,daily_budget,start_time,status,effective_status",
+	"ads":             "id,name,adset_id,campaign_id,account_id,creative,updated_time,status,effective_status",
 	"customaudiences": "id,name,subtype,description,approximate_count_lower_bound,approximate_count_upper_bound,time_created,time_updated",
 }
 
