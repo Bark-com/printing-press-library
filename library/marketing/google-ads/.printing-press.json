@@ -26,7 +26,7 @@
   "mcp_binary": "google-ads-pp-mcp",
   "mcp_tool_count": 162,
   "mcp_ready": "full",
-  "api_version": "v22",
+  "api_version": "v26",
   "auth_type": "bearer_token",
   "auth_env_vars": [
     "GOOGLE_ADS_ACCESS_TOKEN",
