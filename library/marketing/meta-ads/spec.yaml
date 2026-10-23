@@ -823,14 +823,8 @@ components:
           items:
             type: object
             properties:
-              daily_outcomes_curve:
-                type: array
-                items:
-                  type: object
               estimate_ready:
                 type: boolean
-              estimate_dau:
-                type: integer
               estimate_mau_lower_bound:
                 type: integer
               estimate_mau_upper_bound:
